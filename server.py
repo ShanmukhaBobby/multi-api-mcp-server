@@ -33,14 +33,18 @@ Run:  python server.py
 import base64
 import os
 import re
+import secrets
 import zlib
 from typing import Optional
 from urllib.parse import quote
 from xml.etree import ElementTree
 
 import httpx
+import uvicorn
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 load_dotenv()
 
@@ -50,6 +54,15 @@ load_dotenv()
 # same pattern as NASA_API_KEY: the tool below gives a clear setup message
 # rather than a confusing failure if it's missing.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+
+# Optional MCP-level authentication -- only used in "streamable-http" mode
+# (see the __main__ block at the bottom). If MCP_AUTH_TOKEN is unset, the
+# server behaves exactly as before: open, no auth required. If it IS set,
+# every request must include "Authorization: Bearer <that token>" or it's
+# rejected with 401 before it ever reaches any tool. This is a simple shared-
+# secret gate, not full OAuth -- appropriate for a small number of trusted
+# clients (like a colleague's chatbot) rather than public self-service signup.
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
 
 # host/port here only matter when running in "streamable-http" mode (see the
 # __main__ block at the bottom) -- in the normal "stdio" mode (the default,
@@ -619,6 +632,27 @@ def list_capabilities() -> str:
     )
 
 
+class _BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Simple shared-secret gate for the streamable-http transport.
+
+    Only active when MCP_AUTH_TOKEN is set. Every incoming request must send
+    an "Authorization: Bearer <token>" header matching MCP_AUTH_TOKEN exactly,
+    checked with secrets.compare_digest to avoid leaking timing information
+    about how much of the token was guessed correctly. Anything missing or
+    wrong gets a 401 immediately -- it never reaches any tool.
+    """
+
+    async def dispatch(self, request, call_next):
+        auth_header = request.headers.get("authorization", "")
+        expected = f"Bearer {MCP_AUTH_TOKEN}"
+        if not secrets.compare_digest(auth_header, expected):
+            return JSONResponse(
+                {"error": "Unauthorized: missing or invalid bearer token"},
+                status_code=401,
+            )
+        return await call_next(request)
+
+
 if __name__ == "__main__":
     # Two ways this can run, controlled by one environment variable:
     #
@@ -630,11 +664,27 @@ if __name__ == "__main__":
     # a platform like Render.
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "streamable-http":
-        print(
-            f"Starting multi-api-mcp as a standalone HTTP service on port "
-            f"{os.environ.get('PORT', 8000)} (path: /mcp)...",
-            flush=True,
-        )
-        mcp.run(transport="streamable-http")
+        port = int(os.environ.get("PORT", 8000))
+        if MCP_AUTH_TOKEN:
+            print(
+                f"Starting multi-api-mcp as a standalone HTTP service on port "
+                f"{port} (path: /mcp) -- AUTHENTICATION ENABLED (bearer token required)...",
+                flush=True,
+            )
+            # Build the same Starlette app FastMCP would run internally, but
+            # with the auth middleware layered on top, then serve it the same
+            # way FastMCP's own run_streamable_http_async does (identical
+            # host/port/log_level) -- this keeps behavior identical to before
+            # except for the added 401 gate.
+            app = mcp.streamable_http_app()
+            app.add_middleware(_BearerAuthMiddleware)
+            uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        else:
+            print(
+                f"Starting multi-api-mcp as a standalone HTTP service on port "
+                f"{port} (path: /mcp) -- no authentication (MCP_AUTH_TOKEN not set)...",
+                flush=True,
+            )
+            mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
