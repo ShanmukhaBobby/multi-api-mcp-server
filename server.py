@@ -45,6 +45,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 load_dotenv()
 
@@ -643,6 +644,13 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request, call_next):
+        # The health-check route (added below, used by uptime monitors like
+        # UptimeRobot to keep this free-tier service awake) must stay
+        # reachable WITHOUT the bearer token -- monitoring services can't be
+        # given a secret, and requiring auth on it would make every "keep
+        # this awake" ping fail with 401, defeating its entire purpose.
+        if request.url.path in ("/", "/health"):
+            return await call_next(request)
         auth_header = request.headers.get("authorization", "")
         expected = f"Bearer {MCP_AUTH_TOKEN}"
         if not secrets.compare_digest(auth_header, expected):
@@ -665,26 +673,40 @@ if __name__ == "__main__":
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "streamable-http":
         port = int(os.environ.get("PORT", 8000))
+        # Build the same Starlette app FastMCP would run internally, but
+        # with the auth middleware layered on top (if enabled), then serve
+        # it the same way FastMCP's own run_streamable_http_async does
+        # (identical host/port/log_level) -- this keeps behavior identical
+        # to before except for the added 401 gate and the health route below.
+        app = mcp.streamable_http_app()
+
+        # Plain health-check route -- this server otherwise only exposes
+        # /mcp (the real MCP protocol endpoint, which needs a proper MCP
+        # client to talk to, not a plain GET). Uptime monitors (UptimeRobot,
+        # cron-job.org, etc.) used to keep this free-tier service from
+        # spinning down after 15 min idle need a simple GET that returns
+        # 200 -- without this, every ping to "/" was a 404, which made the
+        # monitor falsely report the service as "Down" even when it was
+        # perfectly healthy and running.
+        async def _health(request):
+            return JSONResponse({"status": "ok", "service": "multi-api-mcp"})
+
+        app.router.routes.insert(0, Route("/", _health, methods=["GET"]))
+        app.router.routes.insert(0, Route("/health", _health, methods=["GET"]))
+
         if MCP_AUTH_TOKEN:
             print(
                 f"Starting multi-api-mcp as a standalone HTTP service on port "
                 f"{port} (path: /mcp) -- AUTHENTICATION ENABLED (bearer token required)...",
                 flush=True,
             )
-            # Build the same Starlette app FastMCP would run internally, but
-            # with the auth middleware layered on top, then serve it the same
-            # way FastMCP's own run_streamable_http_async does (identical
-            # host/port/log_level) -- this keeps behavior identical to before
-            # except for the added 401 gate.
-            app = mcp.streamable_http_app()
             app.add_middleware(_BearerAuthMiddleware)
-            uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
         else:
             print(
                 f"Starting multi-api-mcp as a standalone HTTP service on port "
                 f"{port} (path: /mcp) -- no authentication (MCP_AUTH_TOKEN not set)...",
                 flush=True,
             )
-            mcp.run(transport="streamable-http")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
     else:
         mcp.run(transport="stdio")
