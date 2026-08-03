@@ -424,7 +424,14 @@ def generate_image(prompt: str) -> str:
     (don't paraphrase or drop it) so it can be displayed to the user."""
     if not prompt or not prompt.strip():
         raise RuntimeError("A description of the image to generate is required.")
-    encoded = quote(prompt.strip())
+    prompt = prompt.strip()
+    # An overly long prompt embedded directly in a URL can trip a "request
+    # too large" / URL-too-long failure at the HTTP layer -- same failure
+    # class as any other API that receives unbounded text. Cap it defensively
+    # rather than let a verbose model-generated description crash the tool.
+    if len(prompt) > 1200:
+        prompt = prompt[:1200]
+    encoded = quote(prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?nologo=true"
     try:
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
@@ -468,13 +475,19 @@ def create_diagram(diagram_type: str, diagram_source: str) -> str:
     (don't paraphrase or drop it) so it can be displayed to the user."""
     if not diagram_source or not diagram_source.strip():
         raise RuntimeError("Diagram content (diagram_source) is required.")
+    diagram_source = diagram_source.strip()
+    # Diagrams can legitimately be verbose, but not unbounded -- cap defensively
+    # so an oversized diagram_source can't produce a URL long enough to fail,
+    # same principle as generate_image's prompt cap above.
+    if len(diagram_source) > 8000:
+        diagram_source = diagram_source[:8000]
     dtype = (diagram_type or "").strip().lower()
     if dtype not in _KROKI_DIAGRAM_TYPES:
         raise RuntimeError(
             f"'{diagram_type}' isn't a supported diagram type. Use one of: "
             + ", ".join(sorted(_KROKI_DIAGRAM_TYPES))
         )
-    compressed = zlib.compress(diagram_source.strip().encode("utf-8"), 9)
+    compressed = zlib.compress(diagram_source.encode("utf-8"), 9)
     encoded = base64.urlsafe_b64encode(compressed).decode("ascii")
     url = f"https://kroki.io/{dtype}/svg/{encoded}"
     try:
