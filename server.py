@@ -56,6 +56,16 @@ load_dotenv()
 # rather than a confusing failure if it's missing.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
+# GitHub REST API -- reads are genuinely public/keyless, but GitHub's
+# ANONYMOUS rate limit is only 60 requests/hour PER IP, shared across every
+# single caller hitting this server (all your own testing today, plus
+# anyone else using it) -- easy to exhaust during a demo day of heavy
+# testing. Adding a free personal access token (classic, no scopes needed
+# for public reads) raises that same limit to 5,000 requests/hour -- same
+# "optional env var, clear message if missing/exhausted" pattern as
+# YOUTUBE_API_KEY and NASA_API_KEY above.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+
 # Optional MCP-level authentication -- only used in "streamable-http" mode
 # (see the __main__ block at the bottom). If MCP_AUTH_TOKEN is unset, the
 # server behaves exactly as before: open, no auth required. If it IS set,
@@ -103,6 +113,28 @@ def safe_fetch_json(url: str, headers: Optional[dict] = None) -> dict:
                 "total, for the whole world, so it runs out fast). Get a free personal key "
                 "in about 10 seconds at https://api.nasa.gov, then set "
                 "NASA_API_KEY=<your key> in your .env file and restart the server."
+            )
+        if res.status_code == 403 and "api.github.com" in url and res.headers.get("X-RateLimit-Remaining") == "0":
+            # GitHub returns 403 (NOT 429) for its rate limit, and an
+            # unauthenticated request only gets 60/hour, shared across every
+            # caller hitting this server -- easy to exhaust during heavy
+            # testing. Without this check it fell through to the generic
+            # ">= 400" branch below and looked like "user not found" or a
+            # vague failure, when the real cause (and fix) is completely
+            # different and worth surfacing clearly.
+            if GITHUB_TOKEN:
+                raise RuntimeError(
+                    "GitHub's API rate limit was hit even with a token configured "
+                    "(5,000 requests/hour) -- unusual, but it can happen under very "
+                    "heavy testing. Try again shortly."
+                )
+            raise RuntimeError(
+                "GitHub's API rate limit was hit (60 requests/hour for unauthenticated "
+                "requests, shared across everyone using this server -- easy to exhaust "
+                "during testing). Get a free personal access token in about a minute at "
+                "https://github.com/settings/tokens (no scopes needed for public reads), "
+                "then set GITHUB_TOKEN=<your token> in .env and restart -- that raises "
+                "the limit to 5,000 requests/hour."
             )
         if res.status_code == 429:
             raise RuntimeError("Too many requests to this API right now (rate-limited). Try again in a bit.")
@@ -398,7 +430,10 @@ def get_wikipedia_summary(topic: str) -> str:
 def get_github_user(username: str) -> str:
     """Get public profile info for a GitHub username (bio, repo count, followers, etc.)."""
     url = f"https://api.github.com/users/{quote(username)}"
-    data = safe_fetch_json(url, headers={"User-Agent": "multi-api-mcp"})
+    headers = {"User-Agent": "multi-api-mcp"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    data = safe_fetch_json(url, headers=headers)
     return "\n".join(
         [
             f"Name: {data.get('name') or data.get('login')}",
